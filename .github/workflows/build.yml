@@ -39,7 +39,7 @@ jobs:
           cmake --build build --config Release --target Dot50Snap
           set -o pipefail
           mkdir -p snaps && cd snaps
-          ../build/Dot50Snap_artefacts/Release/dot50_snap | tee ../snaps/log.txt
+          ../build/Dot50Snap_artefacts/Release/Dot50Snap | tee ../snaps/log.txt
 
       - name: Publier les captures sur la branche ci-snapshots
         if: always()
