@@ -1,0 +1,126 @@
+name: Build macOS
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  mac:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (universal arm64 + x86_64)
+        run: cmake -S . -B build -G Xcode -DDOT50_COPY_AFTER_BUILD=FALSE "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" -DDOT50_SNAPSHOT_TOOL=ON
+
+      - name: Build VST3 + AU + Standalone
+        run: cmake --build build --config Release --target Dot50_VST3 Dot50_AU Dot50_Standalone
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          A=build/Dot50_artefacts/Release
+          ls -R "$A" | head -40
+          for b in "$A/VST3/DOT50.vst3" "$A/AU/DOT50.component" "$A/Standalone/DOT50.app"; do
+            codesign --force --deep --sign - "$b" || true
+            ditto -c -k --keepParent "$b" "dist/$(basename "$b").zip"
+          done
+          lipo -archs "$A/VST3/DOT50.vst3/Contents/MacOS/DOT50" | tee archs.txt
+          grep -q arm64 archs.txt && grep -q x86_64 archs.txt
+          ls -la dist
+
+      - name: Snapshots de l'interface + test audio (sans écran)
+        continue-on-error: true
+        run: |
+          cmake --build build --config Release --target Dot50Snap
+          set -o pipefail
+          mkdir -p snaps && cd snaps
+          ../build/Dot50Snap_artefacts/Release/dot50_snap | tee ../snaps/log.txt
+
+      - name: Publier les captures sur la branche ci-snapshots
+        if: always()
+        continue-on-error: true
+        run: |
+          cd snaps
+          git init -q -b ci-snapshots
+          git config user.name "ci"; git config user.email "ci@users.noreply.github.com"
+          git add -A && git commit -q -m "snapshots $GITHUB_SHA"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" ci-snapshots
+
+      - name: Validate VST3 (pluginval, strictness 5)
+        continue-on-error: true
+        run: |
+          curl -L -o pluginval.zip https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_macOS.zip
+          unzip -q pluginval.zip
+          ./pluginval.app/Contents/MacOS/pluginval --strictness-level 5 --validate-in-process --timeout-ms 120000 "build/Dot50_artefacts/Release/VST3/DOT50.vst3"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DOT50-macOS
+          path: dist/*.zip
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: DOT50-snapshots
+          path: snaps/*
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (x64)
+        run: cmake -S . -B build -A x64 -DDOT50_COPY_AFTER_BUILD=FALSE
+
+      - name: Build VST3 + Standalone
+        run: |
+          cmake --build build --config Release --target Dot50_VST3
+          cmake --build build --config Release --target Dot50_Standalone
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $A = "build/Dot50_artefacts/Release"
+          Get-ChildItem -Recurse $A | Where-Object { $_.Name -like "DOT50*" } | Select-Object -ExpandProperty FullName
+          Compress-Archive -Path "$A/VST3/DOT50.vst3" -DestinationPath "dist/DOT50-windows.vst3.zip"
+          Compress-Archive -Path "$A/Standalone/DOT50.exe" -DestinationPath "dist/DOT50-windows-standalone.zip"
+          Get-ChildItem dist
+
+      - name: Validate VST3 (pluginval, strictness 5)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Windows.zip -OutFile pluginval.zip
+          Expand-Archive pluginval.zip -DestinationPath pluginval
+          ./pluginval/pluginval.exe --strictness-level 5 --validate-in-process --timeout-ms 120000 "build/Dot50_artefacts/Release/VST3/DOT50.vst3"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DOT50-windows
+          path: dist/*.zip
+
+  release:
+    needs: [mac, windows]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: DOT50-*
+          path: dist
+          merge-multiple: true
+      - name: Release « latest »
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ls -la dist
+          gh release delete latest -y --cleanup-tag -R "$GITHUB_REPOSITORY" || true
+          gh release create latest dist/*.zip -R "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" \
+            --title "DOT50 (dernier build)" \
+            --notes "macOS : VST3 + AU + Standalone (universel, macOS 11+, non notarisé : xattr -dr com.apple.quarantine). Windows : VST3 + Standalone (x64)."
